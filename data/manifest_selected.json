@@ -1,0 +1,162 @@
+﻿[
+    {
+        "case_name":  "synthetic_irregular_model",
+        "gz_path":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_irregular_model\\synthetic_irregular_model_gz.txt",
+        "gzz_path":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_irregular_model\\synthetic_irregular_model_gzz.txt",
+        "true_gravity_field_npz":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_irregular_model\\synthetic_irregular_model_true_gravity_field.npz",
+        "true_voxel_model_npz":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_irregular_model\\synthetic_irregular_model_true_voxel_model.npz",
+        "noise_level":  0.03,
+        "add_regional":  false,
+        "gz_min":  -0.023698994889855385,
+        "gz_max":  0.20415909588336945,
+        "gzz_min":  -0.000189394413609989,
+        "gzz_max":  0.0005264022620394826,
+        "true_field_min":  -4.295954704284668,
+        "true_field_max":  3.2484941482543945,
+        "density_model_min":  -920.0,
+        "density_model_max":  980.0,
+        "anomaly_info":  [
+                             {
+                                 "type":  "positive_branch",
+                                 "shape":  "tilted_branch",
+                                 "center":  [
+                                                1243.6060791015625,
+                                                1600.0,
+                                                1205.1151123046875
+                                            ],
+                                 "size":  700.0,
+                                 "size_xyz":  [
+                                                  85.0,
+                                                  130.0,
+                                                  700.0
+                                              ],
+                                 "density":  980.0,
+                                 "bbox":  {
+                                              "x_min":  850.0,
+                                              "x_max":  1650.0,
+                                              "y_min":  1500.0,
+                                              "y_max":  1700.0,
+                                              "z_min":  600.0,
+                                              "z_max":  1800.0
+                                          },
+                                 "rotation_degrees":  [
+                                                          0.0,
+                                                          34.0,
+                                                          0.0
+                                                      ]
+                             },
+                             {
+                                 "type":  "negative_branch",
+                                 "shape":  "tilted_branch",
+                                 "center":  [
+                                                1720.1165771484375,
+                                                1600.0,
+                                                1448.396484375
+                                            ],
+                                 "size":  620.0,
+                                 "size_xyz":  [
+                                                  85.0,
+                                                  130.0,
+                                                  620.0
+                                              ],
+                                 "density":  -920.0,
+                                 "bbox":  {
+                                              "x_min":  1400.0,
+                                              "x_max":  2050.0,
+                                              "y_min":  1500.0,
+                                              "y_max":  1700.0,
+                                              "z_min":  900.0,
+                                              "z_max":  2000.0
+                                          },
+                                 "rotation_degrees":  [
+                                                          0.0,
+                                                          -28.0,
+                                                          0.0
+                                                      ]
+                             }
+                         ]
+    },
+    {
+        "case_name":  "synthetic_prism_model",
+        "gz_path":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_prism_model\\synthetic_prism_model_gz.txt",
+        "gzz_path":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_prism_model\\synthetic_prism_model_gzz.txt",
+        "true_gravity_field_npz":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_prism_model\\synthetic_prism_model_true_gravity_field.npz",
+        "true_voxel_model_npz":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_prism_model\\synthetic_prism_model_true_voxel_model.npz",
+        "noise_level":  0.03,
+        "add_regional":  false,
+        "gz_min":  0.12289270758628845,
+        "gz_max":  0.3870493471622467,
+        "gzz_min":  7.3781477112788707E-05,
+        "gzz_max":  0.0006460180738940835,
+        "true_field_min":  -7.719846725463867,
+        "true_field_max":  7.719846725463867,
+        "density_model_min":  0.0,
+        "density_model_max":  900.0,
+        "anomaly_info":  [
+                             {
+                                 "type":  "center_box",
+                                 "center":  [
+                                                1600.0,
+                                                1600.0,
+                                                1600.0
+                                            ],
+                                 "size":  450.0,
+                                 "size_xyz":  [
+                                                  450.0,
+                                                  250.0,
+                                                  180.0
+                                              ],
+                                 "density":  900.0
+                             }
+                         ]
+    },
+    {
+        "case_name":  "synthetic_two_prisms_model",
+        "gz_path":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_two_prisms_model\\synthetic_two_prisms_model_gz.txt",
+        "gzz_path":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_two_prisms_model\\synthetic_two_prisms_model_gzz.txt",
+        "true_gravity_field_npz":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_two_prisms_model\\synthetic_two_prisms_model_true_gravity_field.npz",
+        "true_voxel_model_npz":  "E:\\deeplearn\\向下延拓\\向下延拓2\\git\\data\\synthetic_two_prisms_model\\synthetic_two_prisms_model_true_voxel_model.npz",
+        "noise_level":  0.03,
+        "add_regional":  false,
+        "gz_min":  -0.06786026060581207,
+        "gz_max":  0.8408297300338745,
+        "gzz_min":  -0.0008355406462214887,
+        "gzz_max":  0.0020260869059711695,
+        "true_field_min":  -7.867328643798828,
+        "true_field_max":  6.845961570739746,
+        "density_model_min":  -850.0,
+        "density_model_max":  900.0,
+        "anomaly_info":  [
+                             {
+                                 "type":  "positive_box",
+                                 "center":  [
+                                                1300.0,
+                                                1600.0,
+                                                750.0
+                                            ],
+                                 "size":  320.0,
+                                 "size_xyz":  [
+                                                  320.0,
+                                                  220.0,
+                                                  170.0
+                                              ],
+                                 "density":  900.0
+                             },
+                             {
+                                 "type":  "negative_box",
+                                 "center":  [
+                                                1950.0,
+                                                1600.0,
+                                                1450.0
+                                            ],
+                                 "size":  380.0,
+                                 "size_xyz":  [
+                                                  380.0,
+                                                  240.0,
+                                                  230.0
+                                              ],
+                                 "density":  -850.0
+                             }
+                         ]
+    }
+]

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+review_logs*/
+review_checkpoints*/
+runs/
+checkpoints*/
+
+*.log
+*.tmp
+*.filepart

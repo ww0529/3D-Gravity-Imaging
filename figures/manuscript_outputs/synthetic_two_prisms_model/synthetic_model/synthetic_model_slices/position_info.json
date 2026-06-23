@@ -1,0 +1,13 @@
+{
+  "volume_key": "density_model",
+  "volume_label": "Test Voxel Model",
+  "x_index": 43,
+  "y_index": 31,
+  "z_index": 13,
+  "x_coord": 2150.0,
+  "y_coord": 1550.0,
+  "z_coord": 650.0,
+  "depth_coord": 650.0,
+  "threshold_ratio": 0.3,
+  "show_negative": true
+}
