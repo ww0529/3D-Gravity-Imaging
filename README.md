@@ -95,7 +95,7 @@ python generate_manuscript_figures.py --cases synthetic_prism_model vinton_field
 ```
 
 `generate_manuscript_figures.py` contains the real-data inference path needed by
-the figure exporter. It loads `best_model.pth`, builds the same gz/gzz surface
+the figure exporter. It loads `best_model.pth`, builds the same gzz surface
 inputs used for the GUI-style real-data workflow, runs the trained model, and
 then writes the paper-ready figure tree under `figures/manuscript_outputs/`.
 The old standalone `Test Code/test_model.py` backend has been merged into the
