@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +20,6 @@ SOURCE_CODE_DIR = PROJECT_ROOT / "Source Code"
 sys.path.insert(0, str(SOURCE_CODE_DIR))
 sys.path.insert(1, str(SCRIPT_DIR))
 
-test_model = None
 np = None
 plt = None
 cm = None
@@ -27,12 +27,24 @@ colors = None
 ticker = None
 measure = None
 Poly3DCollection = None
+torch = None
+RegularGridInterpolator = None
+gaussian_filter = None
+uniform_filter = None
+label = None
+sobel = None
+build_model_input = None
+get_input_channel_names = None
+get_target_scale = None
+LocalizationAwareHybridUNet = None
 
 
 def _load_project_modules() -> None:
     """Load model dependencies only when figures are actually generated."""
-    global test_model, np, plt, cm, colors, ticker, measure, Poly3DCollection
-    if test_model is not None:
+    global np, plt, cm, colors, ticker, measure, Poly3DCollection
+    global torch, RegularGridInterpolator, gaussian_filter, uniform_filter, label, sobel
+    global build_model_input, get_input_channel_names, get_target_scale, LocalizationAwareHybridUNet
+    if np is not None:
         return
     np = importlib.import_module("numpy")
     matplotlib = importlib.import_module("matplotlib")
@@ -43,7 +55,18 @@ def _load_project_modules() -> None:
     ticker = importlib.import_module("matplotlib.ticker")
     measure = importlib.import_module("skimage.measure")
     Poly3DCollection = importlib.import_module("mpl_toolkits.mplot3d.art3d").Poly3DCollection
-    test_model = importlib.import_module("test_model")
+    torch = importlib.import_module("torch")
+    RegularGridInterpolator = importlib.import_module("scipy.interpolate").RegularGridInterpolator
+    scipy_ndimage = importlib.import_module("scipy.ndimage")
+    gaussian_filter = scipy_ndimage.gaussian_filter
+    uniform_filter = scipy_ndimage.uniform_filter
+    label = scipy_ndimage.label
+    sobel = scipy_ndimage.sobel
+    data_generator = importlib.import_module("data_generator")
+    build_model_input = data_generator.build_model_input
+    get_input_channel_names = data_generator.get_input_channel_names
+    get_target_scale = data_generator.get_target_scale
+    LocalizationAwareHybridUNet = importlib.import_module("network").LocalizationAwareHybridUNet
 
 
 CASE_CATEGORY_FOLDERS = {
@@ -89,6 +112,7 @@ THREE_D_FIGSIZE = (9.2, 6.8)
 THREE_D_DPI = 110
 THREE_D_VIEW_ELEV = 25.0
 THREE_D_VIEW_AZIM = 225.0
+THREE_D_GRID_NUM = 15
 THREE_D_GRID_COLOR = (0.5, 0.5, 0.5, 0.3)
 THREE_D_PANE_FACE_COLOR = (0.95, 0.95, 0.95, 0.3)
 THREE_D_PANE_EDGE_COLOR = (0.8, 0.8, 0.8, 0.3)
@@ -151,6 +175,7 @@ class InferenceResult:
     prediction: np.ndarray
     gradient_magnitude: np.ndarray
     source_response: np.ndarray
+    source_response_raw: np.ndarray | None = None
     true_gravity: np.ndarray | None = None
     true_density: np.ndarray | None = None
     normalization_mode: str = ""
@@ -265,6 +290,16 @@ def _axis_step(coords: np.ndarray, fallback: float = 50.0) -> float:
     return float(np.median(np.diff(coords)))
 
 
+def _display_z_coords(z_coords: np.ndarray) -> np.ndarray:
+    z_values = np.asarray(z_coords, dtype=np.float64).reshape(-1)
+    if z_values.size == 0:
+        return z_values
+    finite = z_values[np.isfinite(z_values)]
+    if finite.size == 0:
+        return z_values
+    return z_values - float(np.min(finite))
+
+
 def _npz_scalar_to_str(value) -> str:
     array = np.asarray(value)
     if array.shape == ():
@@ -283,6 +318,464 @@ def _optional_saved_grid(data, key: str) -> np.ndarray | None:
     return value
 
 
+def _safe_torch_load(checkpoint_path: Path, device):
+    try:
+        return torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(checkpoint_path, map_location=device)
+    except Exception as exc:
+        if "Weights only load failed" in str(exc):
+            return torch.load(checkpoint_path, map_location=device, weights_only=False)
+        raise
+
+
+def _load_model_from_checkpoint(checkpoint_path: Path, device, model_capacity: str | None, input_mode: str | None):
+    checkpoint = _safe_torch_load(checkpoint_path, device)
+    checkpoint_capacity = checkpoint.get("model_capacity")
+    checkpoint_input_mode = checkpoint.get("input_mode")
+    state_dict = checkpoint.get("model_state_dict", {})
+
+    if checkpoint_capacity is not None and model_capacity is not None and model_capacity != checkpoint_capacity:
+        warnings.warn(f"Checkpoint capacity is {checkpoint_capacity!r}; ignoring requested {model_capacity!r}.")
+    if checkpoint_input_mode is not None and input_mode is not None and input_mode != checkpoint_input_mode:
+        warnings.warn(f"Checkpoint input_mode is {checkpoint_input_mode!r}; ignoring requested {input_mode!r}.")
+    if checkpoint_input_mode is None and input_mode not in (None, "gz_amp"):
+        warnings.warn("Legacy checkpoint lacks input_mode metadata; falling back to gz_amp compatibility.")
+
+    resolved_capacity = checkpoint_capacity or model_capacity or "small"
+    resolved_input_mode = checkpoint_input_mode or "gz_amp"
+    input_channels = checkpoint.get("input_channels", len(get_input_channel_names(resolved_input_mode)))
+    use_multimodal_stem = checkpoint.get(
+        "use_multimodal_stem",
+        any(key.startswith("input_adapter.") for key in state_dict),
+    )
+    model = LocalizationAwareHybridUNet(
+        capacity=resolved_capacity,
+        input_channels=input_channels,
+        input_mode=resolved_input_mode,
+        use_multimodal_stem=use_multimodal_stem,
+    ).to(device)
+    try:
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        allowed_missing_prefixes = (
+            "decoder_3d.body_head.",
+            "decoder_3d.center_head.",
+            "decoder_3d.positive_body_head.",
+            "decoder_3d.negative_body_head.",
+            "decoder_3d.axis_head.",
+        )
+        disallowed_missing = [
+            key for key in incompatible.missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+        if disallowed_missing or incompatible.unexpected_keys:
+            raise RuntimeError("Checkpoint architecture mismatch.")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint architecture mismatch. Retrain the checkpoint with the current network before inference."
+        ) from exc
+
+    aux_head_prefixes = (
+        "decoder_3d.body_head.",
+        "decoder_3d.center_head.",
+        "decoder_3d.positive_body_head.",
+        "decoder_3d.negative_body_head.",
+        "decoder_3d.axis_head.",
+    )
+    has_aux_heads = not incompatible.missing_keys or any(key.startswith(aux_head_prefixes) for key in state_dict)
+    return model, checkpoint, resolved_input_mode, has_aux_heads
+
+
+def _select_aux_channel(input_mode: str) -> str:
+    aux_channels = [name for name in get_input_channel_names(input_mode) if name != "gz"]
+    return aux_channels[0] if aux_channels else "gz"
+
+
+def _select_primary_channel(input_mode: str) -> str:
+    return get_input_channel_names(input_mode)[0]
+
+
+def _resolve_input_normalization_mode(checkpoint) -> str:
+    if "input_normalization_mode" in checkpoint:
+        return str(checkpoint["input_normalization_mode"])
+    if "input_mode" in checkpoint:
+        return "gz_ref_aux_separate"
+    return "legacy_shared"
+
+
+def _build_inference_input(surface_channels: dict[str, np.ndarray], input_mode: str, checkpoint):
+    normalization_mode = _resolve_input_normalization_mode(checkpoint)
+    channel_names = get_input_channel_names(input_mode)
+    if normalization_mode == "legacy_shared":
+        scale = max(
+            max(float(np.max(np.abs(surface_channels[channel_name]))), 1e-12)
+            for channel_name in channel_names
+        )
+        input_array = np.stack(
+            [(surface_channels[channel_name] / scale).astype(np.float32) for channel_name in channel_names],
+            axis=0,
+        )
+        return input_array, scale, normalization_mode
+
+    target_scale = get_target_scale(surface_channels)
+    input_array, _, target_scale = build_model_input(
+        surface_channels,
+        input_mode=input_mode,
+        target_scale=target_scale,
+    )
+    return input_array, target_scale, normalization_mode
+
+
+def _load_real_surface_grid(txt_path: Path):
+    arr = np.loadtxt(txt_path, delimiter=",")
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Expected 3 columns (x, y, value) in {txt_path}, got shape {arr.shape}")
+    xs = np.unique(arr[:, 0])
+    ys = np.unique(arr[:, 1])
+    grid = np.full((xs.size, ys.size), np.nan, dtype=np.float64)
+    x_to_idx = {value: idx for idx, value in enumerate(xs)}
+    y_to_idx = {value: idx for idx, value in enumerate(ys)}
+    for x_value, y_value, field_value in arr:
+        grid[x_to_idx[x_value], y_to_idx[y_value]] = field_value
+    if np.isnan(grid).any():
+        raise ValueError(f"Incomplete grid detected in {txt_path}")
+    return xs, ys, grid
+
+
+def _resample_grid_to_model_size(xs, ys, grid, target_size: int = 64):
+    interpolator = RegularGridInterpolator((xs, ys), grid, method="linear", bounds_error=False, fill_value=None)
+    x_new = np.linspace(xs.min(), xs.max(), target_size)
+    y_new = np.linspace(ys.min(), ys.max(), target_size)
+    x_mesh, y_mesh = np.meshgrid(x_new, y_new, indexing="ij")
+    samples = np.stack([x_mesh.ravel(), y_mesh.ravel()], axis=1)
+    return x_new, y_new, interpolator(samples).reshape(target_size, target_size)
+
+
+def _compute_surface_analytic_amplitude(field_2d: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    nx, ny = field_2d.shape
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=dx)
+    ky = 2.0 * np.pi * np.fft.fftfreq(ny, d=dy)
+    kx_grid, ky_grid = np.meshgrid(kx, ky, indexing="ij")
+    radial_k = np.sqrt(kx_grid**2 + ky_grid**2)
+    field_fft = np.fft.fft2(field_2d)
+    dfdx = np.fft.ifft2(1j * kx_grid * field_fft).real
+    dfdy = np.fft.ifft2(1j * ky_grid * field_fft).real
+    dfdz = np.fft.ifft2(radial_k * field_fft).real
+    return np.sqrt(dfdx**2 + dfdy**2 + dfdz**2).astype(np.float32)
+
+
+def _convert_real_channel_to_training_units(channel_name: str, grid: np.ndarray):
+    grid = np.asarray(grid, dtype=np.float32)
+    max_abs = float(np.max(np.abs(grid))) if grid.size else 0.0
+    scale = 1.0
+    assumed_unit = "training_native"
+    if channel_name == "gzz" and 0.0 < max_abs < 1e-5:
+        scale = 1e5
+        assumed_unit = "SI_to_mGal_per_m"
+    elif channel_name == "gz" and 0.0 < max_abs < 1e-2:
+        scale = 1e5
+        assumed_unit = "SI_to_mGal"
+    return (grid * scale).astype(np.float32), {
+        "channel": channel_name,
+        "input_abs_max": max_abs,
+        "applied_scale": scale,
+        "assumed_unit": assumed_unit,
+    }
+
+
+def _surface_fit_metrics(pred_surface: np.ndarray, obs_surface: np.ndarray) -> dict[str, float]:
+    pred = np.asarray(pred_surface, dtype=np.float64).reshape(-1)
+    obs = np.asarray(obs_surface, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(pred) & np.isfinite(obs)
+    if not np.any(mask):
+        return {"corr": np.nan, "rmse": np.nan, "mae": np.nan}
+    pred = pred[mask]
+    obs = obs[mask]
+    return {
+        "corr": float(np.corrcoef(pred, obs)[0, 1]) if pred.size > 1 else np.nan,
+        "rmse": float(np.sqrt(np.mean((pred - obs) ** 2))),
+        "mae": float(np.mean(np.abs(pred - obs))),
+    }
+
+
+def _compute_surface_vertical_gradient_from_volume(field_3d: np.ndarray, z_coords: np.ndarray) -> np.ndarray:
+    volume = np.asarray(field_3d, dtype=np.float32)
+    if volume.ndim != 3 or volume.shape[2] < 2:
+        return np.zeros(volume.shape[:2], dtype=np.float32)
+    z_coords = np.asarray(z_coords, dtype=np.float64).reshape(-1)
+    dz = max(abs(float(z_coords[1] - z_coords[0])) if z_coords.size > 1 else 1.0, 1e-12)
+    if volume.shape[2] >= 3:
+        gradient = (-3.0 * volume[:, :, 0] + 4.0 * volume[:, :, 1] - volume[:, :, 2]) / (2.0 * dz)
+    else:
+        gradient = (volume[:, :, 1] - volume[:, :, 0]) / dz
+    return np.asarray(gradient, dtype=np.float32)
+
+
+def _apply_post_inference_surface_calibration(
+    field_3d: np.ndarray,
+    z_coords: np.ndarray,
+    observed_gz: np.ndarray | None = None,
+    observed_gzz: np.ndarray | None = None,
+    gz_weight: float = 5.0,
+    gzz_weight: float = 5.0,
+    prior_weights=(1.0, 1.0, 1.0),
+):
+    volume = np.asarray(field_3d, dtype=np.float32)
+    corrected = volume.copy()
+    if volume.ndim != 3 or volume.shape[2] < 2:
+        return corrected, {"applied": False, "reason": "insufficient_depth_layers"}
+
+    z_coords = np.asarray(z_coords, dtype=np.float64).reshape(-1)
+    dz = max(abs(float(z_coords[1] - z_coords[0])) if z_coords.size > 1 else 1.0, 1e-12)
+    n_layers = 3 if volume.shape[2] >= 3 else 2
+    prior_weights = np.asarray(prior_weights, dtype=np.float64).reshape(-1)
+    if prior_weights.size < n_layers:
+        prior_weights = np.pad(prior_weights, (0, n_layers - prior_weights.size), mode="edge")
+    prior_weights = np.maximum(prior_weights[:n_layers], 1e-8)
+
+    deriv = np.array([-3.0, 4.0, -1.0], dtype=np.float64) / (2.0 * dz) if n_layers == 3 else np.array([-1.0, 1.0], dtype=np.float64) / dz
+    observed_gz_arr = None if observed_gz is None else np.asarray(observed_gz, dtype=np.float64)
+    observed_gzz_arr = None if observed_gzz is None else np.asarray(observed_gzz, dtype=np.float64)
+    effective_gz_weight = float(gz_weight) if observed_gz_arr is not None else 0.0
+    effective_gzz_weight = float(gzz_weight) if observed_gzz_arr is not None else 0.0
+    if effective_gz_weight <= 0.0 and effective_gzz_weight <= 0.0:
+        return corrected, {"applied": False, "reason": "no_surface_targets"}
+
+    surface_selector = np.zeros((n_layers,), dtype=np.float64)
+    surface_selector[0] = 1.0
+    system = np.diag(prior_weights)
+    if effective_gz_weight > 0.0:
+        system += effective_gz_weight * np.outer(surface_selector, surface_selector)
+    if effective_gzz_weight > 0.0:
+        system += effective_gzz_weight * np.outer(deriv, deriv)
+
+    rhs = volume[:, :, :n_layers].astype(np.float64) * prior_weights.reshape(1, 1, -1)
+    if effective_gz_weight > 0.0:
+        rhs += effective_gz_weight * observed_gz_arr[..., None] * surface_selector.reshape(1, 1, -1)
+    if effective_gzz_weight > 0.0:
+        rhs += effective_gzz_weight * observed_gzz_arr[..., None] * deriv.reshape(1, 1, -1)
+    corrected[:, :, :n_layers] = np.matmul(rhs, np.linalg.inv(system).T).astype(np.float32)
+
+    diagnostics = {"applied": True}
+    if observed_gz_arr is not None:
+        diagnostics["surface_gz_before"] = _surface_fit_metrics(volume[:, :, 0], observed_gz_arr)
+        diagnostics["surface_gz_after"] = _surface_fit_metrics(corrected[:, :, 0], observed_gz_arr)
+    if observed_gzz_arr is not None:
+        diagnostics["surface_gzz_before"] = _surface_fit_metrics(
+            _compute_surface_vertical_gradient_from_volume(volume, z_coords),
+            observed_gzz_arr,
+        )
+        diagnostics["surface_gzz_after"] = _surface_fit_metrics(
+            _compute_surface_vertical_gradient_from_volume(corrected, z_coords),
+            observed_gzz_arr,
+        )
+    return corrected, diagnostics
+
+
+def _build_boundary_taper(shape: tuple[int, int, int], border: int = 4) -> np.ndarray:
+    border = max(0, int(border))
+    if border == 0:
+        return np.ones(shape, dtype=np.float32)
+
+    def axis_window(length: int) -> np.ndarray:
+        if length <= 2:
+            return np.ones(length, dtype=np.float32)
+        current_border = min(border, max(length // 2 - 1, 1))
+        window = np.ones(length, dtype=np.float32)
+        ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, current_border, dtype=np.float32))
+        window[:current_border] = ramp
+        window[-current_border:] = ramp[::-1]
+        return window
+
+    wx = axis_window(shape[0])
+    wy = axis_window(shape[1])
+    wz = axis_window(shape[2])
+    return wx[:, None, None] * wy[None, :, None] * wz[None, None, :]
+
+
+def _zero_boundary_shell(volume: np.ndarray, shell_width: int = 4, fill_value: float = 0.0) -> np.ndarray:
+    shell_width = max(0, int(shell_width))
+    masked = np.array(volume, copy=True)
+    if shell_width == 0 or min(masked.shape) <= 2 * shell_width:
+        return masked
+    masked[:shell_width, :, :] = fill_value
+    masked[-shell_width:, :, :] = fill_value
+    masked[:, :shell_width, :] = fill_value
+    masked[:, -shell_width:, :] = fill_value
+    masked[:, :, :shell_width] = fill_value
+    masked[:, :, -shell_width:] = fill_value
+    return masked
+
+
+def _interior_volume_view(volume: np.ndarray, edge_ignore: int = 4) -> np.ndarray:
+    edge_ignore = max(0, int(edge_ignore))
+    if edge_ignore == 0 or min(volume.shape) <= 2 * edge_ignore:
+        return volume
+    return volume[edge_ignore:-edge_ignore, edge_ignore:-edge_ignore, edge_ignore:-edge_ignore]
+
+
+def _build_interior_weight_2d(shape: tuple[int, int], edge_ignore: int = 4) -> np.ndarray:
+    edge_ignore = max(0, int(edge_ignore))
+    weight = np.ones(shape, dtype=np.float32)
+    if edge_ignore == 0 or min(shape) <= 2 * edge_ignore:
+        return weight
+    weight[:edge_ignore, :] = 0.0
+    weight[-edge_ignore:, :] = 0.0
+    weight[:, :edge_ignore] = 0.0
+    weight[:, -edge_ignore:] = 0.0
+    return weight
+
+
+def _build_interior_weight(shape: tuple[int, int, int], edge_ignore: int = 4) -> np.ndarray:
+    edge_ignore = max(0, int(edge_ignore))
+    weight = np.ones(shape, dtype=np.float32)
+    if edge_ignore == 0 or min(shape) <= 2 * edge_ignore:
+        return weight
+    weight[:edge_ignore, :, :] = 0.0
+    weight[-edge_ignore:, :, :] = 0.0
+    weight[:, :edge_ignore, :] = 0.0
+    weight[:, -edge_ignore:, :] = 0.0
+    weight[:, :, :edge_ignore] = 0.0
+    weight[:, :, -edge_ignore:] = 0.0
+    return weight
+
+
+def _normalize_source_response(response: np.ndarray, edge_ignore: int = 4) -> np.ndarray:
+    response = np.abs(np.asarray(response, dtype=np.float32))
+    interior_weight = _build_interior_weight(response.shape, edge_ignore=edge_ignore)
+    interior_values = response[interior_weight > 0.5]
+    if interior_values.size == 0:
+        interior_values = response.reshape(-1)
+    low_q = float(np.quantile(interior_values, 0.50))
+    high_q = float(np.quantile(interior_values, 0.995))
+    normalized = np.clip((response - low_q) / max(high_q - low_q, 1e-6), 0.0, 1.0)
+    return (normalized * (0.25 + 0.75 * interior_weight)).astype(np.float32)
+
+
+def _normalize_surface_response(response: np.ndarray, edge_ignore: int = 4) -> np.ndarray:
+    response = np.abs(np.asarray(response, dtype=np.float32))
+    interior_weight = _build_interior_weight_2d(response.shape, edge_ignore=edge_ignore)
+    interior_values = response[interior_weight > 0.5]
+    if interior_values.size == 0:
+        interior_values = response.reshape(-1)
+    low_q = float(np.quantile(interior_values, 0.50))
+    high_q = float(np.quantile(interior_values, 0.995))
+    normalized = np.clip((response - low_q) / max(high_q - low_q, 1e-6), 0.0, 1.0)
+    return (normalized * (0.25 + 0.75 * interior_weight)).astype(np.float32)
+
+
+def _compute_volume_derivative_fields(field_3d: np.ndarray, dx: float, dy: float, dz: float, edge_taper_width: int = 4, smooth_sigma: float = 0.8):
+    centered_field = np.asarray(field_3d, dtype=np.float32) - np.float32(np.median(field_3d))
+    tapered_field = centered_field * _build_boundary_taper(centered_field.shape, border=edge_taper_width)
+    dfdx, dfdy, dfdz = np.gradient(tapered_field, dx, dy, dz, edge_order=1)
+    thdr = np.sqrt(dfdx**2 + dfdy**2)
+    asa3d = np.sqrt(dfdx**2 + dfdy**2 + dfdz**2)
+    if smooth_sigma and smooth_sigma > 0:
+        thdr = gaussian_filter(thdr, sigma=smooth_sigma)
+        asa3d = gaussian_filter(asa3d, sigma=smooth_sigma)
+    return {
+        "dfdx": _zero_boundary_shell(dfdx, shell_width=edge_taper_width),
+        "dfdy": _zero_boundary_shell(dfdy, shell_width=edge_taper_width),
+        "dfdz": _zero_boundary_shell(dfdz, shell_width=edge_taper_width),
+        "thdr": _zero_boundary_shell(thdr, shell_width=edge_taper_width),
+        "asa3d": _zero_boundary_shell(asa3d, shell_width=edge_taper_width),
+        "tapered_prediction": tapered_field,
+        "edge_taper_width": edge_taper_width,
+    }
+
+
+def _compute_source_localization_response(field_3d: np.ndarray, dx: float, dy: float, dz: float, edge_ignore: int = 4, smooth_sigma: float = 0.8):
+    centered_field = np.asarray(field_3d, dtype=np.float32) - np.float32(np.median(field_3d))
+    tapered_field = centered_field * _build_boundary_taper(centered_field.shape, border=edge_ignore)
+    grad_x = sobel(tapered_field, axis=0, mode="nearest") / max(float(dx), 1e-6)
+    grad_y = sobel(tapered_field, axis=1, mode="nearest") / max(float(dy), 1e-6)
+    grad_z = sobel(tapered_field, axis=2, mode="nearest") / max(float(dz), 1e-6)
+    gradient_response = np.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
+    envelope_response = uniform_filter(np.abs(tapered_field), size=5, mode="nearest")
+    if smooth_sigma and smooth_sigma > 0:
+        gradient_response = gaussian_filter(gradient_response, sigma=smooth_sigma)
+        envelope_response = gaussian_filter(envelope_response, sigma=smooth_sigma)
+    gradient_response = _normalize_source_response(gradient_response, edge_ignore=edge_ignore)
+    envelope_response = _normalize_source_response(envelope_response, edge_ignore=edge_ignore)
+    source_response = _normalize_source_response(0.78 * gradient_response + 0.22 * envelope_response, edge_ignore=edge_ignore)
+    return {
+        "source_response": source_response,
+        "gradient_response": gradient_response,
+        "envelope_response": envelope_response,
+        "tapered_prediction": tapered_field,
+        "edge_ignore": max(0, int(edge_ignore)),
+    }
+
+
+def _compute_surface_focus_prior(surface_map: np.ndarray, x_coords: np.ndarray, y_coords: np.ndarray, edge_ignore: int = 4):
+    surface_map = np.asarray(surface_map, dtype=np.float32)
+    detrended = surface_map - gaussian_filter(surface_map, sigma=4.2)
+    anomaly_response = _normalize_surface_response(gaussian_filter(detrended, sigma=1.1), edge_ignore=edge_ignore)
+    peak_index = np.unravel_index(np.argmax(anomaly_response), anomaly_response.shape)
+    peak_x = float(x_coords[peak_index[0]])
+    peak_y = float(y_coords[peak_index[1]])
+    x_mesh, y_mesh = np.meshgrid(x_coords, y_coords, indexing="ij")
+    sigma_x = max(650.0, float(abs(x_coords[1] - x_coords[0]) * 6)) if len(x_coords) > 1 else 650.0
+    sigma_y = max(650.0, float(abs(y_coords[1] - y_coords[0]) * 6)) if len(y_coords) > 1 else 650.0
+    gaussian_prior = np.exp(-0.5 * (((x_mesh - peak_x) / sigma_x) ** 2 + ((y_mesh - peak_y) / sigma_y) ** 2)).astype(np.float32)
+    return {
+        "response": anomaly_response,
+        "center": (peak_x, peak_y),
+        "bbox": None,
+        "centers": np.asarray([(peak_x, peak_y)], dtype=np.float64),
+        "bboxes": [],
+        "weight": (0.22 + 0.78 * gaussian_prior).astype(np.float32),
+        "threshold": float(np.max(anomaly_response)) if anomaly_response.size else 0.0,
+    }
+
+
+def _assess_aux_response_confidence(volume: np.ndarray, edge_ignore: int = 4, min_peak: float = 0.08, min_dynamic_range: float = 0.03):
+    volume = np.asarray(volume, dtype=np.float32)
+    interior_values = _interior_volume_view(volume, edge_ignore=edge_ignore).reshape(-1)
+    interior_values = interior_values[np.isfinite(interior_values)]
+    if interior_values.size == 0:
+        return False, {"peak": 0.0, "median": 0.0, "dynamic_range": 0.0}
+    peak = float(np.max(interior_values))
+    median = float(np.median(interior_values))
+    dynamic_range = float(np.quantile(interior_values, 0.995)) - median
+    return peak >= min_peak and dynamic_range >= min_dynamic_range, {
+        "peak": peak,
+        "median": median,
+        "dynamic_range": dynamic_range,
+    }
+
+
+def _combine_body_support_response(source_response: np.ndarray, pred_body_mask=None, pred_center_heatmap=None, edge_ignore: int = 4):
+    combined = _normalize_source_response(source_response, edge_ignore=edge_ignore)
+    diagnostics = {
+        "body_mask_used": False,
+        "center_heatmap_used": False,
+        "body_mask_stats": None,
+        "center_heatmap_stats": None,
+    }
+    if pred_body_mask is not None:
+        body_ok, body_stats = _assess_aux_response_confidence(pred_body_mask, edge_ignore=edge_ignore, min_peak=0.08, min_dynamic_range=0.025)
+        diagnostics["body_mask_stats"] = body_stats
+        if body_ok:
+            combined = 0.58 * _normalize_source_response(pred_body_mask, edge_ignore=edge_ignore) + 0.42 * combined
+            diagnostics["body_mask_used"] = True
+    if pred_center_heatmap is not None:
+        center_ok, center_stats = _assess_aux_response_confidence(pred_center_heatmap, edge_ignore=edge_ignore, min_peak=0.12, min_dynamic_range=0.04)
+        diagnostics["center_heatmap_stats"] = center_stats
+        if center_ok:
+            combined = 0.90 * combined + 0.10 * _normalize_source_response(pred_center_heatmap, edge_ignore=edge_ignore)
+            diagnostics["center_heatmap_used"] = True
+    return _normalize_source_response(combined, edge_ignore=edge_ignore), diagnostics
+
+
+def _build_trusted_body_response(source_response: np.ndarray, surface_prior_weight: np.ndarray, edge_ignore: int = 4, min_depth_idx: int = 5) -> np.ndarray:
+    trusted = np.asarray(source_response, dtype=np.float32) * np.asarray(surface_prior_weight, dtype=np.float32)[..., None]
+    trusted = _zero_boundary_shell(trusted, shell_width=edge_ignore, fill_value=0.0)
+    if 0 < min_depth_idx < trusted.shape[2]:
+        trusted[:, :, :min_depth_idx] = 0.0
+    return _normalize_source_response(trusted, edge_ignore=edge_ignore)
+
+
 def _run_gui_real_data_inference(
     output_dir: Path,
     *,
@@ -293,21 +786,143 @@ def _run_gui_real_data_inference(
     real_gzz_path: Path | None,
     surface_calibration: bool = False,
 ) -> None:
-    """Run the same real-data inference entry point launched by test_model_gui.py."""
+    """Run the real-data inference flow needed by the manuscript exporter."""
+    _load_project_modules()
     _ensure_dir(output_dir)
-    previous_cwd = Path.cwd()
-    try:
-        os.chdir(output_dir)
-        test_model.test_real_data_model(
-            real_gz_path=str(real_gz_path) if real_gz_path is not None else None,
-            real_gzz_path=str(real_gzz_path) if real_gzz_path is not None else None,
-            checkpoint_path=str(checkpoint_path),
-            model_capacity=model_capacity,
-            input_mode=input_mode,
-            surface_calibration=surface_calibration,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, checkpoint, resolved_input_mode, has_aux_heads = _load_model_from_checkpoint(
+        checkpoint_path,
+        device,
+        model_capacity=model_capacity,
+        input_mode=input_mode,
+    )
+    required_channels = get_input_channel_names(resolved_input_mode)
+
+    primary_grid_path = real_gz_path if "gz" in required_channels else real_gzz_path
+    if primary_grid_path is None:
+        raise ValueError(f"Real-data inference for input_mode={resolved_input_mode!r} requires gz or gzz input.")
+
+    primary_xs, primary_ys, primary_grid_raw = _load_real_surface_grid(primary_grid_path)
+    x_model, y_model, primary_grid_model = _resample_grid_to_model_size(primary_xs, primary_ys, primary_grid_raw)
+    primary_grid_model = primary_grid_model - np.mean(primary_grid_model)
+    dx = float(x_model[1] - x_model[0]) if x_model.size > 1 else 1.0
+    dy = float(y_model[1] - y_model[0]) if y_model.size > 1 else 1.0
+
+    surface_channels: dict[str, np.ndarray] = {}
+    unit_conversions = []
+    gz_model = None
+    gz_model_centered = None
+    if real_gz_path is not None:
+        gz_xs, gz_ys, gz_raw = _load_real_surface_grid(real_gz_path)
+        _, _, gz_model = _resample_grid_to_model_size(gz_xs, gz_ys, gz_raw)
+        gz_model, gz_unit_info = _convert_real_channel_to_training_units("gz", gz_model)
+        unit_conversions.append(gz_unit_info)
+        gz_model_centered = gz_model - np.mean(gz_model)
+    if "gz" in required_channels:
+        if gz_model_centered is None:
+            raise ValueError("This checkpoint expects gz input. Provide a gz grid.")
+        surface_channels["gz"] = gz_model_centered
+
+    gzz_model = None
+    if "gzz" in required_channels:
+        if real_gzz_path is None:
+            raise ValueError("This checkpoint expects gzz input. Provide a gzz grid.")
+        gzz_xs, gzz_ys, gzz_raw = _load_real_surface_grid(real_gzz_path)
+        _, _, gzz_model = _resample_grid_to_model_size(gzz_xs, gzz_ys, gzz_raw)
+        gzz_model, gzz_unit_info = _convert_real_channel_to_training_units("gzz", gzz_model)
+        unit_conversions.append(gzz_unit_info)
+        surface_channels["gzz"] = gzz_model - np.mean(gzz_model)
+
+    if "amp" in required_channels:
+        if "gz" not in surface_channels:
+            raise ValueError("Analytic-signal input mode requires gz input.")
+        surface_channels["amp"] = _compute_surface_analytic_amplitude(surface_channels["gz"], dx=dx, dy=dy)
+
+    primary_channel_name = _select_primary_channel(resolved_input_mode)
+    aux_channel_name = _select_aux_channel(resolved_input_mode)
+    aux_surface = surface_channels[aux_channel_name]
+    input_array, target_scale, normalization_mode = _build_inference_input(
+        surface_channels,
+        input_mode=resolved_input_mode,
+        checkpoint=checkpoint,
+    )
+
+    model.eval()
+    with torch.no_grad():
+        input_tensor = torch.from_numpy(input_array[np.newaxis, :, :, :]).float().to(device)
+        output_dict = model(input_tensor)
+        y_pred_norm = output_dict["output"].squeeze().cpu().numpy()
+        pred_body_mask = output_dict.get("body_mask")
+        pred_center_heatmap = output_dict.get("center_heatmap")
+
+    pred_body_mask_np = pred_body_mask.squeeze().cpu().numpy().astype(np.float32) if has_aux_heads and pred_body_mask is not None else None
+    pred_center_heatmap_np = pred_center_heatmap.squeeze().cpu().numpy().astype(np.float32) if has_aux_heads and pred_center_heatmap is not None else None
+    y_pred = y_pred_norm * target_scale
+    raw_y_pred = y_pred.copy()
+    z_coords = np.arange(y_pred.shape[2], dtype=np.float64) * 50.0
+    surface_calibration_diagnostics = {"applied": False, "reason": "disabled"}
+    if surface_calibration:
+        y_pred, surface_calibration_diagnostics = _apply_post_inference_surface_calibration(
+            y_pred,
+            z_coords=z_coords,
+            observed_gz=gz_model_centered,
+            observed_gzz=surface_channels.get("gzz"),
         )
-    finally:
-        os.chdir(previous_cwd)
+
+    edge_ignore = 4
+    min_depth_idx = int(np.searchsorted(z_coords, 250.0, side="left"))
+    focus_surface_name = "gzz" if "gzz" in surface_channels else primary_channel_name
+    surface_focus = _compute_surface_focus_prior(surface_channels[focus_surface_name], x_model, y_model, edge_ignore=edge_ignore)
+    source_fields = _compute_source_localization_response(y_pred, dx=dx, dy=dy, dz=50.0, edge_ignore=edge_ignore)
+    source_response_raw, aux_diagnostics = _combine_body_support_response(
+        source_fields["source_response"],
+        pred_body_mask=pred_body_mask_np,
+        pred_center_heatmap=pred_center_heatmap_np,
+        edge_ignore=edge_ignore,
+    )
+    source_response = _build_trusted_body_response(
+        source_response_raw,
+        surface_focus["weight"],
+        edge_ignore=edge_ignore,
+        min_depth_idx=min_depth_idx,
+    )
+    derivative_fields = _compute_volume_derivative_fields(y_pred, dx=dx, dy=dy, dz=50.0)
+
+    np.savez(
+        output_dir / "real_data_inference_outputs.npz",
+        primary_input=surface_channels[primary_channel_name],
+        primary_input_name=np.array(primary_channel_name),
+        gz_input_raw=gz_model.astype(np.float32) if gz_model is not None else np.array([], dtype=np.float32),
+        gz_input=surface_channels.get("gz", gz_model_centered if gz_model_centered is not None else np.array([], dtype=np.float32)),
+        aux_input=aux_surface,
+        input_channel_names=np.array(required_channels, dtype=object),
+        aux_input_name=np.array(aux_channel_name),
+        prediction=y_pred,
+        prediction_raw=raw_y_pred,
+        prediction_asa3d=derivative_fields["asa3d"],
+        prediction_thdr=derivative_fields["thdr"],
+        prediction_source_response=source_response,
+        prediction_source_response_raw=source_response_raw,
+        prediction_source_gradient=source_fields["gradient_response"],
+        prediction_source_envelope=source_fields["envelope_response"],
+        prediction_body_mask=pred_body_mask_np if pred_body_mask_np is not None else np.array([], dtype=np.float32),
+        prediction_center_heatmap=pred_center_heatmap_np if pred_center_heatmap_np is not None else np.array([], dtype=np.float32),
+        real_input_unit_scales=np.array([info["applied_scale"] for info in unit_conversions], dtype=np.float64),
+        real_input_unit_channels=np.array([info["channel"] for info in unit_conversions], dtype=object),
+        surface_calibration_applied=np.array(int(surface_calibration_diagnostics.get("applied", False)), dtype=np.int8),
+        prediction_surface_prior_response=surface_focus["response"],
+        prediction_surface_prior_weight=surface_focus["weight"],
+        surface_prior_center=np.array(surface_focus["center"], dtype=np.float64),
+        surface_prior_centers=np.asarray(surface_focus["centers"], dtype=np.float64),
+        surface_prior_bboxes=np.array([], dtype=np.float64),
+        body_mask_used=np.array(int(aux_diagnostics["body_mask_used"]), dtype=np.int8),
+        center_heatmap_used=np.array(int(aux_diagnostics["center_heatmap_used"]), dtype=np.int8),
+        normalization_mode=np.array(normalization_mode),
+        target_scale=np.array(target_scale, dtype=np.float64),
+        x_coords=x_model,
+        y_coords=y_model,
+        z_coords=z_coords,
+    )
 
 
 def _load_gui_real_data_result(
@@ -344,6 +959,22 @@ def _load_gui_real_data_result(
         if "target_scale" in data.files:
             target_scale = float(np.asarray(data["target_scale"], dtype=np.float64))
 
+        if "prediction_source_response_raw" in data.files:
+            source_response_raw = np.asarray(data["prediction_source_response_raw"], dtype=np.float32)
+        elif "source_response_raw" in data.files:
+            source_response_raw = np.asarray(data["source_response_raw"], dtype=np.float32)
+        elif "source_response" in data.files:
+            source_response_raw = np.asarray(data["source_response"], dtype=np.float32)
+        else:
+            source_response_raw = np.asarray(data["prediction_source_response"], dtype=np.float32)
+
+        if "prediction_source_response" in data.files:
+            source_response = np.asarray(data["prediction_source_response"], dtype=np.float32)
+        elif "source_response" in data.files:
+            source_response = np.asarray(data["source_response"], dtype=np.float32)
+        else:
+            source_response = source_response_raw
+
         result = InferenceResult(
             case_name=case_name,
             x=np.asarray(data["x_coords"], dtype=np.float64).reshape(-1),
@@ -352,7 +983,8 @@ def _load_gui_real_data_result(
             surface_channels=surface_channels,
             prediction=np.asarray(data["prediction"], dtype=np.float32),
             gradient_magnitude=np.asarray(data["prediction_asa3d"], dtype=np.float32),
-            source_response=np.asarray(data["prediction_source_response"], dtype=np.float32),
+            source_response=source_response,
+            source_response_raw=source_response_raw,
             true_gravity=true_gravity,
             true_density=true_density,
             normalization_mode=normalization_mode,
@@ -367,7 +999,8 @@ def _cleanup_gui_backend_intermediates(output_dir: Path) -> None:
         if path.exists():
             path.unlink()
 
-    for profile_dir in (output_dir / "surface_fit", output_dir / "地表拟合"):
+    legacy_profile_dir = "\u5730\u8868\u62df\u5408"
+    for profile_dir in (output_dir / "surface_fit", output_dir / legacy_profile_dir):
         if profile_dir.exists():
             shutil.rmtree(profile_dir)
 
@@ -418,16 +1051,31 @@ def _plot_abs_isosurface(ax, volume: np.ndarray, coords: tuple[np.ndarray, np.nd
     level = _positive_isosurface_level(abs_volume, ratio=0.30)
     if level is None:
         ax.text2D(0.5, 0.5, "No isosurface", transform=ax.transAxes, ha="center", va="center")
+        ax.set_title(title, fontsize=11, fontweight="bold")
         return
-    test_model._plot_isosurface(
-        ax,
-        abs_volume,
-        spacing=(dx, dy, dz),
-        title=title,
-        level=level,
-        cmap_name=cmap_name,
-        edge_ignore=0,
-    )
+    if not (float(np.min(abs_volume)) < level < float(np.max(abs_volume))):
+        ax.text2D(0.5, 0.5, "Invalid isosurface level", transform=ax.transAxes, ha="center", va="center")
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        return
+
+    verts, faces, _, _ = measure.marching_cubes(abs_volume, level=level, spacing=(dx, dy, dz))
+    origin = np.array([float(x[0]), float(y[0]), float(z[0])], dtype=np.float64)
+    verts = verts + origin
+    face_vertices = verts[faces]
+    face_depth = face_vertices[:, :, 2].mean(axis=1)
+    norm = colors.Normalize(vmin=float(face_depth.min()), vmax=float(face_depth.max()) + 1e-12)
+    face_colors = cm.get_cmap(cmap_name)(norm(face_depth))
+    mesh = Poly3DCollection(face_vertices, facecolors=face_colors, edgecolor="none", alpha=0.68)
+    ax.add_collection3d(mesh)
+    ax.set_xlim(float(x.min()), float(x.max()))
+    ax.set_ylim(float(y.min()), float(y.max()))
+    ax.set_zlim(float(z.max()), float(z.min()))
+    ax.set_box_aspect((float(np.ptp(x)), float(np.ptp(y)), float(np.ptp(z))))
+    ax.view_init(elev=24, azim=-56)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title(f"{title}\nIso={level:.3e}", fontsize=11, fontweight="bold")
 
 
 def _plot_3d_slice(
@@ -516,7 +1164,7 @@ def _field_unit_text(field_name: str | None) -> str:
         "gz": "mGal",
         "amp": "mGal/m",
         "prediction": "mGal",
-        "density_model": "kg/m³",
+        "density_model": "kg/m^3",
         "body_response": "",
     }
     return unit_map.get(str(field_name), "")
@@ -745,6 +1393,98 @@ def _set_3d_axes_style(ax, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> None:
     ax.yaxis.pane.set_edgecolor(THREE_D_PANE_EDGE_COLOR)
     ax.zaxis.pane.set_edgecolor(THREE_D_PANE_EDGE_COLOR)
     ax.grid(True)
+
+
+def _apply_gui_dense_3d_axis_style(
+    ax,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    z_coords: np.ndarray,
+    *,
+    elev: float = THREE_D_VIEW_ELEV,
+    azim: float = THREE_D_VIEW_AZIM,
+) -> None:
+    x_values = np.asarray(x_coords, dtype=np.float64).reshape(-1)
+    y_values = np.asarray(y_coords, dtype=np.float64).reshape(-1)
+    z_display = _display_z_coords(z_coords)
+
+    if x_values.size == 0:
+        x_values = np.array([0.0, 1.0], dtype=np.float64)
+    if y_values.size == 0:
+        y_values = np.array([0.0, 1.0], dtype=np.float64)
+    if z_display.size == 0:
+        z_display = np.array([0.0, 1.0], dtype=np.float64)
+
+    x_min = float(np.min(x_values))
+    x_max = float(np.max(x_values))
+    y_min = float(np.min(y_values))
+    y_max = float(np.max(y_values))
+    z_min = float(np.min(z_display))
+    z_max = float(np.max(z_display))
+
+    if np.isclose(x_min, x_max):
+        x_max = x_min + 1.0
+    if np.isclose(y_min, y_max):
+        y_max = y_min + 1.0
+    if np.isclose(z_min, z_max):
+        z_max = z_min + 1.0
+
+    ax.set_title("")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.zaxis.set_rotate_label(False)
+    ax.set_zlabel("Depth (m)", rotation=90)
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_zlim(z_max, z_min)
+
+    ax.xaxis.pane.fill = True
+    ax.yaxis.pane.fill = True
+    ax.zaxis.pane.fill = True
+    ax.xaxis.pane.set_facecolor(THREE_D_PANE_FACE_COLOR)
+    ax.yaxis.pane.set_facecolor(THREE_D_PANE_FACE_COLOR)
+    ax.zaxis.pane.set_facecolor(THREE_D_PANE_FACE_COLOR)
+    ax.xaxis.pane.set_edgecolor(THREE_D_PANE_EDGE_COLOR)
+    ax.yaxis.pane.set_edgecolor(THREE_D_PANE_EDGE_COLOR)
+    ax.zaxis.pane.set_edgecolor(THREE_D_PANE_EDGE_COLOR)
+
+    ax.xaxis._axinfo["grid"]["linewidth"] = 0.5
+    ax.yaxis._axinfo["grid"]["linewidth"] = 0.5
+    ax.zaxis._axinfo["grid"]["linewidth"] = 0.5
+    ax.xaxis._axinfo["grid"]["color"] = (0.3, 0.3, 0.3, 0.6)
+    ax.yaxis._axinfo["grid"]["color"] = (0.3, 0.3, 0.3, 0.6)
+    ax.zaxis._axinfo["grid"]["color"] = (0.3, 0.3, 0.3, 0.6)
+    ax.grid(True, alpha=0.35)
+
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(4))
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(4))
+    ax.zaxis.set_major_locator(ticker.MaxNLocator(4))
+    ax.tick_params(axis="both", labelsize=8)
+    ax.tick_params(axis="z", labelsize=8)
+
+    x_grid = np.linspace(x_min, x_max, THREE_D_GRID_NUM)
+    y_grid = np.linspace(y_min, y_max, THREE_D_GRID_NUM)
+    z_grid = np.linspace(z_min, z_max, THREE_D_GRID_NUM)
+
+    x_top, y_top = np.meshgrid(x_grid, y_grid)
+    z_top = np.full_like(x_top, z_min)
+    ax.plot_wireframe(x_top, y_top, z_top, color=THREE_D_GRID_COLOR, linewidth=0.3)
+
+    x_back, z_back = np.meshgrid(x_grid, z_grid)
+    y_back = np.full_like(x_back, y_min)
+    ax.plot_wireframe(x_back, y_back, z_back, color=THREE_D_GRID_COLOR, linewidth=0.3)
+
+    y_left, z_left = np.meshgrid(y_grid, z_grid)
+    x_left = np.full_like(y_left, x_min)
+    ax.plot_wireframe(x_left, y_left, z_left, color=THREE_D_GRID_COLOR, linewidth=0.3)
+
+    x_span = max(x_max - x_min, 1.0)
+    y_span = max(y_max - y_min, 1.0)
+    z_span = max(z_max - z_min, 1.0)
+    max_span = max(x_span, y_span, z_span)
+    z_scale = max(1.0, max_span / z_span * 0.6) if z_span > 0 else 1.0
+    ax.set_box_aspect((x_span / max_span, y_span / max_span, z_span / max_span * z_scale))
+    ax.view_init(elev=elev, azim=azim)
 
 
 def _add_3d_colorbar(fig, ax, mappable, field_name: str | None) -> None:
@@ -1034,6 +1774,7 @@ def _add_signed_isosurface(
     level_ratio: float = 0.30,
     signed: bool = True,
     alpha: float = 0.62,
+    isosurface_color_value: float | None = None,
 ) -> bool:
     values = np.asarray(volume, dtype=np.float32)
     finite_abs = np.abs(values[np.isfinite(values)])
@@ -1064,7 +1805,10 @@ def _add_signed_isosurface(
             continue
         verts, faces, _, _ = measure.marching_cubes(surface_volume, level=level, spacing=spacing)
         verts = verts + origin
-        face_color = mappable.to_rgba(signed_level if signed else level)
+        color_value = signed_level if isosurface_color_value is None else float(isosurface_color_value)
+        if not signed and isosurface_color_value is None:
+            color_value = level
+        face_color = mappable.to_rgba(color_value)
         mesh = Poly3DCollection(verts[faces], facecolors=[face_color], edgecolor="none", alpha=alpha)
         ax.add_collection3d(mesh)
         drawn = True
@@ -1083,6 +1827,7 @@ def _save_gui_3d_isosurface(
     level_ratio: float = 0.30,
     bboxes: list[tuple[float, float, float, float, float, float]] | None = None,
     boundary_volume: np.ndarray | None = None,
+    isosurface_color_value: float | None = None,
 ) -> Path:
     fig = plt.figure(figsize=THREE_D_FIGSIZE, dpi=THREE_D_DPI, facecolor="white")
     ax = fig.add_subplot(111, projection="3d")
@@ -1097,6 +1842,7 @@ def _save_gui_3d_isosurface(
         level_ratio=level_ratio,
         signed=signed,
         alpha=0.70 if field_name == "density_model" else 0.58,
+        isosurface_color_value=isosurface_color_value,
     )
     if not drawn:
         ax.text2D(0.5, 0.5, "No positive isosurface", transform=ax.transAxes, ha="center", va="center")
@@ -1105,6 +1851,109 @@ def _save_gui_3d_isosurface(
     mappable.set_array(np.asarray(volume, dtype=np.float32))
     _add_3d_colorbar(fig, ax, mappable, field_name)
     return _save_figure(fig, path, dpi=THREE_D_DPI)
+
+
+def _save_gui_raw_body_response_isosurface(
+    path: Path,
+    volume: np.ndarray,
+    result: InferenceResult,
+    *,
+    threshold_ratio: float = 0.30,
+) -> Path:
+    values = np.asarray(volume, dtype=np.float32)
+    finite_mask = np.isfinite(values)
+    fig = plt.figure(figsize=(9.4, 6.9), dpi=THREE_D_DPI, facecolor="white")
+    ax = fig.add_subplot(111, projection="3d")
+
+    if not np.any(finite_mask):
+        ax.text2D(0.5, 0.5, "No valid data", transform=ax.transAxes, ha="center", va="center")
+        _apply_gui_dense_3d_axis_style(ax, result.x, result.y, result.z)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(path), dpi=THREE_D_DPI, facecolor="white")
+        plt.close(fig)
+        return path
+
+    finite_values = values[finite_mask]
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    if abs(vmax - vmin) < 1e-12:
+        vmax = vmin + 1e-12
+
+    value_range = vmax - vmin
+    center = (vmax + vmin) / 2.0
+    pos_level = center + value_range * float(threshold_ratio) / 2.0
+
+    x_values = np.asarray(result.x, dtype=np.float64).reshape(-1)
+    y_values = np.asarray(result.y, dtype=np.float64).reshape(-1)
+    z_values = np.asarray(result.z, dtype=np.float64).reshape(-1)
+    x_min = float(x_values.min()) if x_values.size else 0.0
+    y_min = float(y_values.min()) if y_values.size else 0.0
+    z_display_values = _display_z_coords(z_values if z_values.size else np.arange(values.shape[2], dtype=np.float64))
+    z_min = float(z_display_values.min()) if z_display_values.size else 0.0
+
+    spacing = (_axis_step(z_values), _axis_step(y_values), _axis_step(x_values))
+    volume_zyx = np.transpose(np.nan_to_num(values, nan=center), (2, 1, 0))
+    data_max = float(np.max(volume_zyx))
+    cmap = _display_cmap("magma")
+    norm = colors.Normalize(vmin=vmin, vmax=vmax)
+
+    ax.clear()
+    ax.set_facecolor("none")
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.xaxis.pane.set_edgecolor((0.8, 0.8, 0.8, 0.3))
+    ax.yaxis.pane.set_edgecolor((0.8, 0.8, 0.8, 0.3))
+    ax.zaxis.pane.set_edgecolor((0.8, 0.8, 0.8, 0.3))
+
+    surfaces_drawn = 0
+    if pos_level < data_max:
+        try:
+            verts, faces, _normals, surface_values = measure.marching_cubes(volume_zyx, level=pos_level, spacing=spacing)
+            verts_plot = np.zeros_like(verts)
+            verts_plot[:, 0] = verts[:, 2] + x_min
+            verts_plot[:, 1] = verts[:, 1] + y_min
+            verts_plot[:, 2] = verts[:, 0] + z_min
+
+            face_values = surface_values[faces].mean(axis=1)
+            face_colors = cmap(norm(face_values))
+            mesh = Poly3DCollection(verts_plot[faces], alpha=0.85)
+            mesh.set_facecolor(face_colors)
+            mesh.set_edgecolor("none")
+            ax.add_collection3d(mesh)
+            surfaces_drawn += 1
+        except Exception:
+            pass
+
+    if surfaces_drawn == 0:
+        ax.text(
+            float(np.mean(x_values)) if x_values.size else 0.0,
+            float(np.mean(y_values)) if y_values.size else 0.0,
+            float(np.mean(z_display_values)) if z_display_values.size else 0.0,
+            "No isosurface\n(adjust threshold)",
+            ha="center",
+            va="center",
+            fontsize=10,
+        )
+
+    color_mapper = cm.ScalarMappable(norm=norm, cmap=cmap)
+    color_mapper.set_array([vmin, vmax])
+    colorbar = fig.colorbar(
+        color_mapper,
+        ax=ax,
+        fraction=THREE_D_COLORBAR_LAYOUT["fraction"],
+        pad=THREE_D_COLORBAR_LAYOUT["pad"],
+        shrink=THREE_D_COLORBAR_LAYOUT["shrink"],
+        aspect=int(THREE_D_COLORBAR_LAYOUT["aspect"]),
+    )
+    _apply_colorbar_display(colorbar, "body_response", tick_labelsize=8)
+
+    _apply_gui_dense_3d_axis_style(ax, result.x, result.y, result.z)
+    fig.subplots_adjust(left=0.02, right=THREE_D_COLORBAR_LAYOUT["subplot_right"], bottom=0.02, top=0.98)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=THREE_D_DPI, facecolor="white")
+    plt.close(fig)
+    return path
 
 
 def _save_gui_3d_slice(
@@ -1395,9 +2244,9 @@ def save_reference_case_outputs(
     indices = _slice_indices_from_metadata(result, metadata)
     prediction_norm, prediction_extend = _build_publication_norm(result.prediction, symmetric=True)
     response_norm, response_extend = _build_body_response_projection_norm(result.source_response)
-    response_isosurface_norm, _ = _build_publication_norm(result.source_response, symmetric=False)
     prediction_cmap = _display_cmap("jet")
     response_cmap = _display_cmap("magma")
+    raw_source_response = result.source_response_raw if result.source_response_raw is not None else result.source_response
 
     paths.append(
         _save_gui_2d_map(
@@ -1444,17 +2293,11 @@ def save_reference_case_outputs(
     )
     paths.extend(_save_body_response_2d_slices(result, output_dir, indices, response_norm, response_extend, boundary_volume))
     paths.append(
-        _save_gui_3d_isosurface(
+        _save_gui_raw_body_response_isosurface(
             output_dir / "gradient_magnitude_3d_field" / "gradient_magnitude_3d_field.png",
-            result.source_response,
+            raw_source_response,
             result,
-            field_name="body_response",
-            norm=response_isosurface_norm,
-            cmap=response_cmap,
-            signed=False,
-            level_ratio=0.70,
-            bboxes=None,
-            boundary_volume=None,
+            threshold_ratio=0.30,
         )
     )
     paths.extend(
@@ -1717,7 +2560,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--surface-calibration",
         action="store_true",
-        help="Enable the same optional post-inference surface calibration exposed by gzz/test_model_gui.py.",
+        help="Enable optional post-inference surface calibration.",
     )
     return parser
 

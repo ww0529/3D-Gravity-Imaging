@@ -12,7 +12,6 @@ This repository contains the reproducibility package for **3D Gravity Imaging vi
     train.py
   Test Code/
     generate_manuscript_figures.py
-    test_model.py
   data/
     synthetic_prism_model/
     synthetic_two_prisms_model/
@@ -95,6 +94,13 @@ To generate only selected cases:
 python generate_manuscript_figures.py --cases synthetic_prism_model vinton_field_data
 ```
 
+`generate_manuscript_figures.py` contains the real-data inference path needed by
+the figure exporter. It loads `best_model.pth`, builds the same gz/gzz surface
+inputs used for the GUI-style real-data workflow, runs the trained model, and
+then writes the paper-ready figure tree under `figures/manuscript_outputs/`.
+The old standalone `Test Code/test_model.py` backend has been merged into the
+exporter so the reproducibility package has one manuscript-figure entry point.
+
 ## Run Test Codes
 
 The packaged test code reproduces the paper-style visualization outputs:
@@ -105,6 +111,11 @@ The packaged test code reproduces the paper-style visualization outputs:
 - 3D slices of the predicted gravity field
 - magnitude of the gradient of the 3D gravity field
 - synthetic model slices for the three synthetic examples
+
+The current exported PNG set includes body-boundary mapping overlays on the 2D
+and 3D slice views where a synthetic reference volume is available. The main
+predicted 3D gravity-field isosurface images intentionally remain clean and do
+not draw body-boundary overlays.
 
 The output root is:
 
