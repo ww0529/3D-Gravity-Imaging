@@ -98,8 +98,6 @@ python generate_manuscript_figures.py --cases synthetic_prism_model vinton_field
 the figure exporter. It loads `best_model.pth`, builds the same gzz surface
 inputs used for the GUI-style real-data workflow, runs the trained model, and
 then writes the paper-ready figure tree under `figures/manuscript_outputs/`.
-The old standalone `Test Code/test_model.py` backend has been merged into the
-exporter so the reproducibility package has one manuscript-figure entry point.
 
 ## Run Test Codes
 
