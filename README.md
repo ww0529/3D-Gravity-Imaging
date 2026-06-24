@@ -1,12 +1,6 @@
 # 3D Gravity Imaging
 
 This repository contains the reproducibility package for **3D Gravity Imaging via 3D FFT Gravity Forward Modeling and Deep Learning**. The project reconstructs a volumetric subsurface gravity field from surface gravity-gradient observations.
-
-<p align="center">
-  <img src="figures/manuscript_outputs/synthetic_prism_model/predicted_3d_gravity_field/predicted_3d_gravity_field.png" width="45%" alt="Predicted 3D gravity field for the synthetic prism model">
-  <img src="figures/manuscript_outputs/vinton_field_data/gradient_magnitude_3d_field/gradient_magnitude_3d_field.png" width="45%" alt="Magnitude of the gradient of the 3D gravity field for Vinton field data">
-</p>
-
 ## Repository Structure
 
 ```text
