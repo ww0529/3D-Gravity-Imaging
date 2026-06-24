@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from data_generator import create_dataloader, get_input_channel_names
 from network import LocalizationAwareHybridUNet
-from loss_functions_fully_corrected import FullyCorrectHybridPhysicsLoss, CosineAnnealingWarmRestarts
+from loss_functions import FullyCorrectHybridPhysicsLoss, CosineAnnealingWarmRestarts
 
 
 DEFAULT_CONFIG = {

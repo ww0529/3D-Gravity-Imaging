@@ -13,9 +13,9 @@ This repository contains the reproducibility package for **3D Gravity Imaging vi
 3D Gravity Imaging/
   Source Code/
     data_generator.py
-    loss_functions_fully_corrected.py
+    loss_functions.py
     network.py
-    train_fully_corrected.py
+    train.py
   Test Code/
     generate_manuscript_figures.py
     test_model.py
@@ -63,7 +63,7 @@ Run a short verification training job from `Source Code`:
 
 ```bash
 cd "Source Code"
-python train_fully_corrected.py ^
+python train.py ^
   --epochs 1 ^
   --train-samples 4 ^
   --val-samples 2 ^
